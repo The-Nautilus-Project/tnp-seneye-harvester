@@ -254,6 +254,44 @@ td.plug-stale .since{color:var(--critical)}
 .alert.offline .dot{background:var(--offline)}
 .alert.good .dot{background:var(--good)}
 
+/* chiller schedule compliance. The schedule exists because the cabinet can
+   only take one chiller running by day and three overnight; this strip says
+   whether that is being respected and whether each system got its block. */
+.sched{
+  border:1px solid var(--rule);background:var(--surface);margin:0 0 18px;
+  font-size:13.5px;
+}
+.sched[hidden]{display:none}
+.sched .top{
+  display:flex;align-items:center;flex-wrap:wrap;gap:8px 16px;padding:11px 14px;
+  border-bottom:1px solid var(--grid);
+}
+.sched .mark{width:11px;height:11px;flex:none;background:var(--good)}
+.sched.warning{border-color:color-mix(in srgb,var(--warning) 55%,var(--rule))}
+.sched.warning .mark{background:var(--warning)}
+.sched.critical{border-color:color-mix(in srgb,var(--critical) 55%,var(--rule))}
+.sched.critical .mark{background:var(--critical)}
+.sched .headline{font-weight:600}
+.sched.critical .headline{color:var(--critical)}
+.sched .block{color:var(--muted)}
+.sched .count{margin-left:auto;font-size:12px;color:var(--muted);
+  border:1px solid var(--rule);padding:2px 8px}
+.sched .count.over{border-color:var(--critical);color:var(--critical);font-weight:600}
+.sched .body{padding:11px 14px;display:flex;flex-wrap:wrap;gap:16px 26px}
+.sched .col{min-width:210px}
+.sched .col h4{margin:0 0 5px;font-size:12px;font-weight:600;color:var(--muted)}
+.sched .col ul{margin:0;padding:0;list-style:none}
+.sched .col li{padding:1px 0;color:var(--ink-2)}
+.sched .col li b{font-weight:600;color:var(--ink)}
+.sched .col li.bad b{color:var(--critical)}
+.sched .none{color:var(--muted)}
+.sched .hours{display:flex;flex-wrap:wrap;gap:4px 10px}
+.sched .hours span{font-variant-numeric:tabular-nums}
+.sched .hours i{font-style:normal;color:var(--muted)}
+.sched .hours span.short i,.sched .hours span.short{color:var(--warning);font-weight:600}
+.sched .foot{padding:9px 14px;border-top:1px solid var(--grid);font-size:12px;
+  color:var(--muted);line-height:1.5}
+
 /* slide replacement countdown */
 .slides-strip{
   display:flex;align-items:center;flex-wrap:wrap;gap:8px 16px;font-size:13px;
@@ -523,6 +561,8 @@ footer.notes code{font-variant-numeric:tabular-nums;font-size:11.5px;background:
   </div>
 
   <div class="alerts" id="alerts"></div>
+
+  <div class="sched" id="sched" hidden></div>
 
   <div class="slides-strip" id="slides-strip" hidden></div>
 
@@ -1627,6 +1667,235 @@ footer.notes code{font-variant-numeric:tabular-nums;font-size:11.5px;background:
         "this page only reads them.";
       box.appendChild(note);
     }
+  }
+
+  // ---- chiller schedule compliance -------------------------------------
+  //
+  // The nursery runs nine chillers off a timetable, and the timetable exists
+  // because the cabinet can only take one running by day and three overnight.
+  // Two things can go wrong and neither announces itself: more chillers on
+  // than the cabinet allows, and a system that slept through its block because
+  // its plug was off the network when the schedule fired. A Smart Life
+  // schedule does not retry. This strip is the only place either becomes
+  // visible without going and looking.
+
+  function fmtClock(t) { return fmtTime(t); }
+
+  function renderSchedule() {
+    var box = el("sched");
+    var sc = state.data.schedule || {};
+    if (!sc.enabled || !sc.ready) { box.hidden = true; return; }
+    box.hidden = false;
+    box.textContent = "";
+
+    var n = sc.now || {};
+    var missing = n.missing || [], extra = n.unexpected || [];
+    var over = !!n.over_limit;
+
+    // The first version coloured this strip green whenever the current minute
+    // was clean, which it did on a morning that had already lost two blocks
+    // and run four chillers against a limit of three. "Now" is not the only
+    // thing worth knowing, so anything that went wrong today counts too.
+    var dayStart = new Date(today() * 1000);
+    dayStart.setHours(0, 0, 0, 0);
+    var since = Math.floor(dayStart.getTime() / 1000);
+    var missedToday = (sc.misses || []).filter(function (m) { return m.from >= since; });
+    var breachedToday = (sc.breaches || []).filter(function (b) { return b.from >= since; });
+
+    var kind = over ? "critical"
+      : (missing.length || extra.length || breachedToday.length) ? "warning"
+      : missedToday.length ? "warning" : "";
+    box.className = "sched" + (kind ? " " + kind : "");
+
+    var top = document.createElement("div");
+    top.className = "top";
+    var mk = document.createElement("span");
+    mk.className = "mark"; mk.setAttribute("aria-hidden", "true");
+    top.appendChild(mk);
+
+    var head = document.createElement("span");
+    head.className = "headline";
+    head.textContent = over
+      ? n.running + " chillers running, the cabinet allows " + n.limit
+      : missing.length
+        ? (missing.length === 1 ? missing[0] + " is not cooling and should be"
+                                : missing.length + " systems are not cooling and should be")
+        : extra.length
+          ? extra.join(", ") + " running outside " +
+            (extra.length === 1 ? "its" : "their") + " block"
+          : breachedToday.length
+            ? "Over the cabinet limit earlier today"
+            : missedToday.length
+              ? (missedToday.length === 1 ? "One block missed today"
+                                          : missedToday.length + " blocks missed today")
+              : "Running to schedule";
+    top.appendChild(head);
+
+    // When the headline is about something earlier, say what is happening now
+    // as well, so the strip never reads as though the nursery is in trouble
+    // this minute when it is not.
+    if (!over && !missing.length && !extra.length && (missedToday.length || breachedToday.length)) {
+      var okNow = document.createElement("span");
+      okNow.className = "block";
+      okNow.textContent = "running to schedule now";
+      top.appendChild(okNow);
+    }
+
+    if (n.block) {
+      var blk = document.createElement("span");
+      blk.className = "block";
+      blk.textContent = n.block.label + " block, " +
+        (n.expected.length ? n.expected.join(", ") : "nothing scheduled");
+      top.appendChild(blk);
+    }
+
+    var cnt = document.createElement("span");
+    cnt.className = "count" + (over ? " over" : "");
+    cnt.textContent = n.running + " of " + (n.limit === null ? "–" : n.limit) + " allowed";
+    cnt.title = "The cabinet takes one chiller running between 12:00 and 21:00 " +
+                "and three overnight. Each DC2200 rejects about 2.95 kW into it.";
+    top.appendChild(cnt);
+    box.appendChild(top);
+
+    var body = document.createElement("div");
+    body.className = "body";
+
+    // what is wrong right now
+    var col1 = document.createElement("div");
+    col1.className = "col";
+    var h1 = document.createElement("h4"); h1.textContent = "Right now";
+    col1.appendChild(h1);
+    var ul1 = document.createElement("ul");
+    if (!missing.length && !extra.length) {
+      var okli = document.createElement("li");
+      okli.className = "none";
+      okli.textContent = !n.expected.length
+        ? "Nothing is scheduled for this block."
+        : n.expected.length === 1
+          ? n.expected[0] + " is cooling, as scheduled."
+          : "All " + n.expected.length + " scheduled systems are cooling.";
+      ul1.appendChild(okli);
+    }
+    missing.forEach(function (sump) {
+      var li = document.createElement("li");
+      li.className = "bad";
+      var b = document.createElement("b"); b.textContent = sump;
+      li.appendChild(b);
+      li.appendChild(document.createTextNode(" should be cooling and is not"));
+      ul1.appendChild(li);
+    });
+    extra.forEach(function (sump) {
+      var li = document.createElement("li");
+      var b = document.createElement("b"); b.textContent = sump;
+      li.appendChild(b);
+      li.appendChild(document.createTextNode(" is cooling outside its block"));
+      ul1.appendChild(li);
+    });
+    col1.appendChild(ul1);
+    body.appendChild(col1);
+
+    // blocks nobody noticed being missed
+    var misses = (sc.misses || []).slice(-6).reverse();
+    var col2 = document.createElement("div");
+    col2.className = "col";
+    var h2 = document.createElement("h4");
+    h2.textContent = "Blocks missed, last three days";
+    col2.appendChild(h2);
+    var ul2 = document.createElement("ul");
+    if (!misses.length) {
+      var li = document.createElement("li");
+      li.className = "none";
+      li.textContent = "None. Every scheduled block ran.";
+      ul2.appendChild(li);
+    } else {
+      misses.forEach(function (m) {
+        var li = document.createElement("li");
+        li.className = "bad";
+        var b = document.createElement("b"); b.textContent = m.sump;
+        li.appendChild(b);
+        li.appendChild(document.createTextNode(
+          " missed " + m.label + " on " + fmtDate(m.from)));
+        li.title = "It ran for " + Math.round(m.fraction * 100) + "% of that block. " +
+          "A plug that is off the network when the schedule fires misses the " +
+          "event outright, and nothing retries.";
+        ul2.appendChild(li);
+      });
+    }
+    col2.appendChild(ul2);
+    body.appendChild(col2);
+
+    // cabinet breaches
+    var br = (sc.breaches || []).slice(-5).reverse();
+    if (br.length) {
+      var col3 = document.createElement("div");
+      col3.className = "col";
+      var h3 = document.createElement("h4");
+      h3.textContent = "Over the cabinet limit";
+      col3.appendChild(h3);
+      var ul3 = document.createElement("ul");
+      br.forEach(function (b) {
+        var li = document.createElement("li");
+        li.className = "bad";
+        var strong = document.createElement("b");
+        strong.textContent = b.peak + " running";
+        li.appendChild(strong);
+        li.appendChild(document.createTextNode(
+          " against " + b.limit + ", " + fmtDate(b.from) + " " +
+          fmtClock(b.from) + "–" + fmtClock(b.to)));
+        li.title = b.sumps.join(", ");
+        ul3.appendChild(li);
+      });
+      col3.appendChild(ul3);
+      body.appendChild(col3);
+    }
+
+    // yesterday's hours against the schedule's own targets
+    var days = sc.daily || [];
+    var yday = days.length > 1 ? days[days.length - 2] : null;
+    if (yday) {
+      var col4 = document.createElement("div");
+      col4.className = "col";
+      var h4 = document.createElement("h4");
+      h4.textContent = "Cooling hours on " + fmtDate(yday.day);
+      col4.appendChild(h4);
+      var hours = document.createElement("div");
+      hours.className = "hours";
+      Object.keys(yday.by_sump).sort().forEach(function (sump) {
+        var v = yday.by_sump[sump];
+        var span = document.createElement("span");
+        // A tenth of an hour either way is the harvest interval, not a fault.
+        var short = v.target && v.hours < v.target - 0.3;
+        if (short) span.className = "short";
+        span.textContent = sump + " " + v.hours.toFixed(2) + " h";
+        var i = document.createElement("i");
+        i.textContent = v.target ? " / " + v.target : "";
+        span.appendChild(i);
+        span.title = v.target
+          ? sump + " ran " + v.hours.toFixed(2) + " h against a target of " + v.target + " h"
+            + (v.unconfirmed_hours ? ". " + v.unconfirmed_hours.toFixed(2) +
+               " h of that was while the plug was off the network, so its state " +
+               "is assumed rather than confirmed." : "")
+          : "";
+        hours.appendChild(span);
+      });
+      col4.appendChild(hours);
+      body.appendChild(col4);
+    }
+
+    box.appendChild(body);
+
+    var foot = document.createElement("div");
+    foot.className = "foot";
+    var worst = null;
+    Object.keys(sc.gaps || {}).forEach(function (sump) {
+      if (!worst || sc.gaps[sump].hours > sc.gaps[worst].hours) worst = sump;
+    });
+    foot.textContent =
+      (worst ? "Longest spell without cooling in the last three days: " + worst +
+               ", " + sc.gaps[worst].hours.toFixed(2) + " hours. " : "") +
+      "The schedule is run by the plugs themselves. This page only checks that " +
+      "what happened matches what was planned, and cannot switch anything.";
+    box.appendChild(foot);
   }
 
   function renderAlerts() {
@@ -3414,6 +3683,7 @@ footer.notes code{font-variant-numeric:tabular-nums;font-size:11.5px;background:
     if (state.view === "sensor") {
       renderControls();
       renderAlerts();
+      renderSchedule();
       renderSlides();
       renderDetail();
       renderPanels();
@@ -3421,6 +3691,7 @@ footer.notes code{font-variant-numeric:tabular-nums;font-size:11.5px;background:
       buildExport(el("export-sensor"), "sensor");
     } else {
       el("slides-strip").hidden = true;
+      el("sched").hidden = true;
       renderLab();
       renderInsituCharts();
       buildExport(el("export-insitu"), "insitu");
