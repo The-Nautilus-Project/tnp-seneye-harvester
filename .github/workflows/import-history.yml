@@ -18,14 +18,18 @@ on:
   workflow_dispatch:
     inputs:
       timezone:
-        description: "Timezone the export's timestamps are in (ask Seneye)"
+        # Seneye's own export is in UK time, not Gibraltar time: its
+        # timestamps run an hour ahead of UTC in September and the clocks
+        # change on the UK dates. Verified against the live readings, so
+        # Europe/London is the default here.
+        description: "Timezone the export's timestamps are in"
         required: true
-        default: "UTC"
+        default: "Europe/London"
         type: choice
         options:
           - Europe/London
-          - UTC
           - Europe/Gibraltar
+          - UTC
       folder:
         description: "Folder in the repo holding the CSVs"
         required: true
@@ -57,6 +61,7 @@ permissions:
 jobs:
   import:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 

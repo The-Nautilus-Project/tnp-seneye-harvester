@@ -20,9 +20,18 @@ on:
       - "!dashboard/data/**"
       - "config.json"
 
-concurrency:
-  group: harvest
-  cancel-in-progress: false
+# No workflow-level concurrency. It used to be here, one group called
+# "harvest" covering the whole run, and that turned out to be the thing that
+# jammed the repository: the publish job waits on the github-pages environment,
+# so a deploy that stalls holds the lock for the harvest job as well. Every
+# scheduled run then queued behind a run that was never going to finish, and
+# GitHub cancelled each one in turn with "a higher priority waiting request for
+# harvest exists".
+#
+# The two jobs below hold their own locks instead. Harvests serialise against
+# each other and against an import, because they write to the same SQLite file.
+# Pages deploys serialise against each other, because GitHub allows one at a
+# time. Neither can block the other any more.
 
 permissions:
   contents: write
@@ -32,6 +41,12 @@ permissions:
 jobs:
   harvest:
     runs-on: ubuntu-latest
+    # A hung job used to hold the lock until GitHub's own six-hour ceiling.
+    # A harvest that has not finished in ten minutes is stuck, not slow.
+    timeout-minutes: 10
+    concurrency:
+      group: harvest
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
 
@@ -56,7 +71,17 @@ jobs:
           TUYA_ACCESS_ID: ${{ secrets.TUYA_ACCESS_ID }}
           TUYA_ACCESS_SECRET: ${{ secrets.TUYA_ACCESS_SECRET }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python -m harvester.harvest
+        run: |
+          # A push is somebody uploading a file, not a reason to poll Seneye and
+          # Tuya. Rebuilding the export from what is already stored picks up a
+          # config.json change and takes seconds, so uploading a batch of files
+          # no longer parks a queue of full harvests behind the scheduled one.
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "push event: rebuilding the export, not polling the sensors"
+            python -m harvester.harvest --export-only
+          else
+            python -m harvester.harvest
+          fi
 
       # With no DATABASE_URL the SQLite file and the exports live in the repo,
       # which keeps the whole thing free and self-contained.
@@ -84,6 +109,10 @@ jobs:
     needs: harvest
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
+    timeout-minutes: 10
+    concurrency:
+      group: pages
+      cancel-in-progress: false
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
