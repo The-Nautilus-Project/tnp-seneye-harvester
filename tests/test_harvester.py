@@ -1,5 +1,6 @@
 """Unit tests. Run with: python -m unittest discover -s tests -v"""
 
+import collections
 import datetime as dt
 import json
 import math
@@ -13,6 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from harvester.export import _daily_stats, _slides, build_payload
 from harvester import plugs
+from harvester import schedule as sched
 from tools import sensor_cadence, swap_device
 from harvester.seneye import parse_reading
 from harvester.store import Store
@@ -1531,6 +1533,223 @@ class TestPlugExport(unittest.TestCase):
         payload = build_payload(bare, PLUG_CONFIG, 30, 30)
         self.assertEqual(payload["plugs"]["by_sump"], {})
         self.assertFalse(payload["ambient"]["enabled"])
+
+
+# ---------------------------------------------------------------------------
+# Checking the nursery against the chiller schedule
+# ---------------------------------------------------------------------------
+
+try:
+    from zoneinfo import ZoneInfo
+    GIB = ZoneInfo("Europe/Gibraltar")
+except Exception:  # pragma: no cover
+    GIB = dt.timezone.utc
+
+SCHEDULE = {
+    "enabled": True,
+    "timezone": "Europe/Gibraltar",
+    "limits": [{"from": "12:00", "to": "21:00", "max_running": 1},
+               {"from": "21:00", "to": "12:00", "max_running": 3}],
+    "blocks": [
+        {"from": "21:00", "to": "23:30", "sumps": ["SB12", "SB34", "SC34"]},
+        {"from": "23:30", "to": "02:00", "sumps": ["SA345", "SD12", "SD345"]},
+        {"from": "02:00", "to": "04:30", "sumps": ["SA12", "SC12", "SE12"]},
+        {"from": "04:30", "to": "07:00", "sumps": ["SB12", "SB34", "SC34"]},
+        {"from": "07:00", "to": "09:30", "sumps": ["SA345", "SD12", "SD345"]},
+        {"from": "09:30", "to": "12:00", "sumps": ["SA12", "SC12", "SE12"]},
+        {"from": "12:00", "to": "14:15", "sumps": ["SA345"]},
+        {"from": "14:15", "to": "16:30", "sumps": ["SA12"]},
+        {"from": "16:30", "to": "18:45", "sumps": ["SC12"]},
+        {"from": "18:45", "to": "21:00", "sumps": ["SE12"]},
+    ],
+    "daily_target_hours": {"SA12": 7.25, "SA345": 7.25, "SC12": 7.25, "SE12": 7.25,
+                           "SB12": 5.0, "SB34": 5.0, "SC34": 5.0,
+                           "SD12": 5.0, "SD345": 5.0},
+}
+
+SOCKETS = {"SA12": ("plugA", "switch_1"), "SA345": ("plugA", "switch_2"),
+           "SB12": ("plugB", "switch_1"), "SB34": ("plugB", "switch_2"),
+           "SC12": ("plugC", "switch_1"), "SC34": ("plugC", "switch_2"),
+           "SD12": ("plugD", "switch_1"), "SD345": ("plugD", "switch_2"),
+           "SE12": ("plugE", "switch_1")}
+
+
+def at(y, m, d, hh, mm=0):
+    return int(dt.datetime(y, m, d, hh, mm, tzinfo=GIB).timestamp())
+
+
+def play(store, cfg, start, end, skip=()):
+    """Write the transitions a set of plugs would produce running the schedule.
+
+    `skip` drops named (sump, local hour) block starts, which is how a missed
+    block is simulated: the plug was off the network when the event fired.
+    """
+    events = []
+    for o in sched.occurrences(cfg, start, end, GIB):
+        for sump in o["sumps"]:
+            if (sump, o["label"]) in skip:
+                continue
+            events.append((o["from"], sump, 1))
+            events.append((o["to"], sump, 0))
+    events.sort()
+    state = {}
+    with store.cursor() as cur:
+        for t, sump, on in events:
+            if state.get(sump) == on:
+                continue
+            state[sump] = on
+            dev, sock = SOCKETS[sump]
+            cur.execute(
+                "INSERT OR REPLACE INTO plug_states (device_id, socket, changed_at, "
+                "last_seen, sump_code, role, on_state, online) VALUES (?,?,?,?,?,?,?,?)",
+                (dev, sock, t, t, sump, "chiller", on, 1))
+
+
+class TestScheduleModel(unittest.TestCase):
+    def test_a_block_that_crosses_midnight_is_one_block_not_two(self):
+        runs = sched.occurrences(SCHEDULE, at(2026, 10, 7, 20), at(2026, 10, 8, 3), GIB)
+        night = [o for o in runs if o["label"] == "23:30\u201302:00"]
+        self.assertTrue(night)
+        self.assertEqual(night[0]["to"] - night[0]["from"], int(2.5 * 3600))
+
+    def test_the_cabinet_limit_follows_the_time_of_day(self):
+        self.assertEqual(sched.limit_at(SCHEDULE, at(2026, 10, 8, 13), GIB), 1)
+        self.assertEqual(sched.limit_at(SCHEDULE, at(2026, 10, 8, 3), GIB), 3)
+        # the boundaries themselves belong to the block they open
+        self.assertEqual(sched.limit_at(SCHEDULE, at(2026, 10, 8, 12), GIB), 1)
+        self.assertEqual(sched.limit_at(SCHEDULE, at(2026, 10, 8, 21), GIB), 3)
+
+    # occurrences() returns every block OVERLAPPING the window, which is what
+    # compliance needs: the 23:30 block belongs to the night it starts and has
+    # to be judged whole. Totalling a day therefore means clipping to the day,
+    # or the block that straddles midnight is counted at both ends.
+    @staticmethod
+    def _clipped(a, z):
+        total = collections.Counter()
+        for o in sched.occurrences(SCHEDULE, a, z, GIB):
+            inside = max(0, min(o["to"], z) - max(o["from"], a))
+            for sump in o["sumps"]:
+                total[sump] += inside
+        return total
+
+    def test_every_sump_runs_the_hours_the_schedule_promises(self):
+        total = self._clipped(at(2026, 10, 8, 0), at(2026, 10, 9, 0))
+        for sump, target in SCHEDULE["daily_target_hours"].items():
+            self.assertAlmostEqual(total[sump] / 3600, target, places=2, msg=sump)
+
+    def test_the_whole_timetable_is_fifty_four_chiller_hours(self):
+        total = self._clipped(at(2026, 10, 8, 0), at(2026, 10, 9, 0))
+        self.assertAlmostEqual(sum(total.values()) / 3600, 54.0, places=2)
+
+    def test_a_block_is_returned_whole_even_when_it_straddles_the_window(self):
+        runs = sched.occurrences(SCHEDULE, at(2026, 10, 8, 0), at(2026, 10, 9, 0), GIB)
+        night = [o for o in runs if o["label"] == "23:30\u201302:00"]
+        self.assertEqual(len(night), 2)
+        self.assertTrue(all(o["to"] - o["from"] == int(2.5 * 3600) for o in night))
+
+    def test_a_malformed_time_is_refused_rather_than_guessed(self):
+        for bad in ("", "9", "25:00", "12:60", "noon"):
+            with self.assertRaises(ValueError):
+                sched._hhmm(bad)
+
+
+class TestScheduleCompliance(unittest.TestCase):
+    def setUp(self):
+        self.store = Store("sqlite:///:memory:")
+        self.store.migrate()
+        self.now = at(2026, 10, 8, 13)
+        self.config = {"schedule": SCHEDULE}
+
+    def run_perfect(self, skip=()):
+        play(self.store, SCHEDULE, self.now - 3 * 86400, self.now, skip=skip)
+        return sched.build(self.store, self.config, self.now, days=3)
+
+    def test_a_schedule_run_perfectly_reports_nothing_wrong(self):
+        out = self.run_perfect()
+        self.assertEqual(out["misses"], [])
+        self.assertEqual(out["breaches"], [])
+        self.assertFalse(out["now"]["over_limit"])
+
+    def test_it_knows_what_should_be_running_this_minute(self):
+        out = self.run_perfect()["now"]
+        self.assertEqual(out["expected"], ["SA345"])
+        self.assertEqual(out["actual"], ["SA345"])
+        self.assertEqual(out["missing"], [])
+        self.assertEqual(out["unexpected"], [])
+
+    def test_what_is_on_now_comes_from_the_last_transition(self):
+        # The open span ends at `now`, so bracketing it with start <= t < end
+        # reported an idle nursery at exactly the moment anyone would ask.
+        play(self.store, SCHEDULE, self.now - 86400, self.now)
+        spans = sched.spans(self.store.query(
+            "SELECT device_id, socket, changed_at, sump_code, on_state, online "
+            "FROM plug_states ORDER BY changed_at"), self.now)
+        self.assertIn("SA345", sched.running_at(spans, self.now))
+
+    def test_a_block_the_plug_slept_through_is_reported_as_missed(self):
+        out = self.run_perfect(skip=(("SC12", "09:30\u201312:00"),
+                                     ("SE12", "09:30\u201312:00")))
+        missed = {(m["sump"], m["label"]) for m in out["misses"]}
+        self.assertIn(("SC12", "09:30\u201312:00"), missed)
+        self.assertIn(("SE12", "09:30\u201312:00"), missed)
+        self.assertTrue(all(m["fraction"] < 0.2 for m in out["misses"]))
+
+    def test_a_missed_block_lengthens_that_sumps_worst_gap(self):
+        clean = self.run_perfect()["gaps"]["SE12"]["hours"]
+        self.setUp()
+        after = self.run_perfect(skip=(("SE12", "09:30\u201312:00"),))["gaps"]["SE12"]["hours"]
+        self.assertGreater(after, clean)
+
+    def test_a_fourth_chiller_overnight_is_a_cabinet_breach(self):
+        play(self.store, SCHEDULE, self.now - 3 * 86400, self.now)
+        a, z = at(2026, 10, 8, 2), at(2026, 10, 8, 4, 30)
+        with self.store.cursor() as cur:
+            for t, on in ((a, 1), (z, 0)):
+                cur.execute(
+                    "INSERT OR REPLACE INTO plug_states (device_id, socket, changed_at, "
+                    "last_seen, sump_code, role, on_state, online) VALUES (?,?,?,?,?,?,?,?)",
+                    ("plugD", "switch_1", t, t, "SD12", "chiller", on, 1))
+        out = sched.build(self.store, self.config, self.now, days=3)
+        self.assertTrue(out["breaches"])
+        worst = max(b["peak"] for b in out["breaches"])
+        self.assertEqual(worst, 4)
+        self.assertEqual(out["breaches"][0]["limit"], 3)
+
+    def test_one_extra_chiller_in_the_day_lockout_is_a_breach(self):
+        play(self.store, SCHEDULE, self.now - 3 * 86400, self.now)
+        t = at(2026, 10, 8, 12, 30)
+        with self.store.cursor() as cur:
+            cur.execute(
+                "INSERT OR REPLACE INTO plug_states (device_id, socket, changed_at, "
+                "last_seen, sump_code, role, on_state, online) VALUES (?,?,?,?,?,?,?,?)",
+                ("plugB", "switch_1", t, t, "SB12", "chiller", 1, 1))
+        out = sched.build(self.store, self.config, self.now, days=3)
+        self.assertEqual(out["now"]["unexpected"], ["SB12"])
+        self.assertTrue(out["now"]["over_limit"])
+        self.assertEqual(out["now"]["running"], 2)
+        self.assertEqual(out["now"]["limit"], 1)
+
+    def test_a_full_day_matches_the_schedules_own_targets(self):
+        out = self.run_perfect()
+        full = [d for d in out["daily"] if len(d["by_sump"]) == 9][1]
+        for sump, got in full["by_sump"].items():
+            self.assertAlmostEqual(got["hours"], got["target"], places=2, msg=sump)
+
+    def test_time_a_plug_was_offline_is_counted_but_flagged(self):
+        play(self.store, SCHEDULE, self.now - 86400, self.now)
+        with self.store.cursor() as cur:
+            cur.execute("UPDATE plug_states SET online = 0 WHERE sump_code = 'SB12'")
+        out = sched.build(self.store, self.config, self.now, days=1)
+        day = out["daily"][-1]["by_sump"]["SB12"]
+        self.assertGreater(day["unconfirmed_hours"], 0)
+
+    def test_the_schedule_switched_off_exports_nothing(self):
+        out = sched.build(self.store, {"schedule": {"enabled": False}}, self.now)
+        self.assertEqual(out, {"enabled": False})
+
+    def test_no_plug_history_says_so_rather_than_claiming_compliance(self):
+        out = sched.build(self.store, self.config, self.now)
+        self.assertFalse(out.get("ready"))
 
 
 if __name__ == "__main__":
