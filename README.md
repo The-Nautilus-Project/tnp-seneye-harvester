@@ -573,6 +573,79 @@ change in a stable room. Occasional gaps of many hours mixed with short ones
 usually mean it dropped off the network rather than that the air stopped
 moving.
 
+## The chiller schedule
+
+Nine chillers run off a timetable, and the timetable exists because of a hard
+constraint: the cabinet takes one chiller running between 12:00 and 21:00 and
+three overnight, since each DC2200 rejects about 2.95 kW into it. The schedule
+lives in the plugs, through Smart Life. **This repository never switches
+anything.** The dashboard is a static file on a public website and the day it
+can turn a chiller off is the day a student can too.
+
+What it does instead is check that what happened matches what was planned. The
+timetable is written into `config.json > schedule`, and the strip at the top of
+the dashboard answers three questions.
+
+**Is the right thing running this minute**, and is the cabinet limit being
+respected. Two chillers during the day lockout is the failure that damages
+equipment, so it outranks everything else on the strip.
+
+**Did each system actually get its block.** This is the one that matters most
+in practice. A Smart Life schedule fires at the block boundary and a plug that
+is off the network at that moment misses it outright; nothing retries. Rows C
+and E sat dark for days in September that way and nothing anywhere said so.
+Losing a 2.5-hour block from a timetable built around a 16 °C time-average is
+not a rounding error.
+
+**How long each system went without cooling**, measured across the whole window
+rather than per calendar day. Clipping at midnight split the one gap that
+matters most, because the overnight stretch is the long one.
+
+Editing a block in `config.json` changes only what the dashboard expects to
+see. A change made in Smart Life has to be made here too, or the page reports a
+fault that is not one.
+
+### Three corrections to the schedule document
+
+Building the check against the timetable turned up three errors in the
+*Longest gap without cooling* column of `Chiller_schedule_2026`:
+
+| System | Document | Actual |
+| --- | --- | --- |
+| SE12 | 5.0 h | **6.75 h** |
+| SC12 | 7.5 h | 7.25 h |
+| SA345 | 9.0 h | 9.25 h |
+
+The SE12 one is worth acting on. It runs 02:00–04:30, 09:30–12:00 and
+18:45–21:00, so it sits from **12:00 to 18:45 with no cooling**, through the
+hottest part of the day, on a seagrass system. The document understates that by
+nearly two hours. Every runtime figure and the 54 chiller-hour total check out
+exactly; it is only the gap column.
+
+## Energy
+
+Taken by integrating the half-hourly power readings, not from the plugs' own
+`add_ele` counter. That counter resets whenever a plug loses power and two of
+the five have been stuck on the same figure for over a week, so it is the
+number that would look most authoritative on a dashboard while being the least
+true. It is stored and never shown, only so we can tell later whether it starts
+behaving.
+
+Accuracy, measured against a simulation where the true answer was known: **0.5%
+over a fortnight, and about 15% day to day.** A compressor cycles on its own
+thermostat, so half-hourly spot readings of it are a sampling problem; over a
+month the errors cancel, over one day they do not. Each day carries a
+`coverage` figure, so a day the harvester only watched for ten hours is not
+mistaken for a quiet one.
+
+The meter is per plug, so consumption is per row rather than per sump. Your
+schedule happens to separate most of them anyway: Rows A, C and E never run
+both sockets at once, while Rows B and D always run both together.
+
+Set `plugs.tariff.per_kwh` to see a cost. From the schedule's own figures, 54
+chiller-hours a day at roughly 750 W is about 40.5 kWh a day, or just under
+14,800 kWh a year, before the cabinet extraction fan.
+
 ### When a device is reset
 
 A Tuya device that is factory reset comes back with a brand new device ID, and
@@ -818,6 +891,7 @@ Mock rows carry `slide_serial` values beginning `MOCK-`; clear them with
 ```
 harvester/    seneye.py (API client) · nutrients.py (sheet + workbook reader)
               plugs.py (Tuya chiller plugs + air sensor, read only)
+              schedule.py (checks the nursery against the chiller timetable)
               maintenance.py (issues + planned jobs) · store.py (database)
               export.py (JSON) · harvest.py (CLI)
 dashboard/    index.html + data/   (public)

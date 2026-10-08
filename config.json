@@ -195,6 +195,13 @@
     "region": "eu",
     "stale_minutes": 90,
     "ambient_stale_hours": 6,
+    "meter_gap_minutes": 90,
+    "tariff": {
+      "_comment": "Set 'per_kwh' to the nursery's electricity price and the dashboard shows a cost beside each row's consumption. Leave it null and only kilowatt-hours are shown. The figure is an estimate from half-hourly readings, so treat it as an indication of which row costs most to run rather than anything to put on a grant claim.",
+      "per_kwh": null,
+      "currency": "GBP",
+      "symbol": "£"
+    },
     "subscription_expires": "2027-04-30",
     "subscription_warn_days": 14,
     "note": "Chiller state is read from the plugs every harvest. It is shown here and switched from the Smart Life app.",
@@ -309,6 +316,130 @@
         }
       }
     }
+  },
+  "schedule": {
+    "_comment": "The nursery chiller schedule, as designed in Chiller_schedule_2026. The dashboard does not run it: the plugs do, through Smart Life. What this block is for is checking that what the plugs actually did matches what was planned. Times are local to 'timezone' and a block whose 'to' is earlier than its 'from' runs over midnight. 'limits' is the cabinet constraint that the whole timetable exists to respect, one chiller running by day and three overnight, because each running DC2200 rejects about 2.95 kW into the enclosure. Editing a block here changes only what the dashboard expects to see, never what the plugs do, so a change made in Smart Life has to be made here too or the page will report a fault that is not one.",
+    "enabled": true,
+    "timezone": "Europe/Gibraltar",
+    "target_c": 16,
+    "limits": [
+      {
+        "from": "12:00",
+        "to": "21:00",
+        "max_running": 1
+      },
+      {
+        "from": "21:00",
+        "to": "12:00",
+        "max_running": 3
+      }
+    ],
+    "blocks": [
+      {
+        "from": "21:00",
+        "to": "23:30",
+        "sumps": [
+          "SB12",
+          "SB34",
+          "SC34"
+        ]
+      },
+      {
+        "from": "23:30",
+        "to": "02:00",
+        "sumps": [
+          "SA345",
+          "SD12",
+          "SD345"
+        ]
+      },
+      {
+        "from": "02:00",
+        "to": "04:30",
+        "sumps": [
+          "SA12",
+          "SC12",
+          "SE12"
+        ]
+      },
+      {
+        "from": "04:30",
+        "to": "07:00",
+        "sumps": [
+          "SB12",
+          "SB34",
+          "SC34"
+        ]
+      },
+      {
+        "from": "07:00",
+        "to": "09:30",
+        "sumps": [
+          "SA345",
+          "SD12",
+          "SD345"
+        ]
+      },
+      {
+        "from": "09:30",
+        "to": "12:00",
+        "sumps": [
+          "SA12",
+          "SC12",
+          "SE12"
+        ]
+      },
+      {
+        "from": "12:00",
+        "to": "14:15",
+        "sumps": [
+          "SA345"
+        ]
+      },
+      {
+        "from": "14:15",
+        "to": "16:30",
+        "sumps": [
+          "SA12"
+        ]
+      },
+      {
+        "from": "16:30",
+        "to": "18:45",
+        "sumps": [
+          "SC12"
+        ]
+      },
+      {
+        "from": "18:45",
+        "to": "21:00",
+        "sumps": [
+          "SE12"
+        ]
+      }
+    ],
+    "daily_target_hours": {
+      "SA12": 7.25,
+      "SA345": 7.25,
+      "SC12": 7.25,
+      "SE12": 7.25,
+      "SB12": 5.0,
+      "SB34": 5.0,
+      "SC34": 5.0,
+      "SD12": 5.0,
+      "SD345": 5.0
+    },
+    "setpoints": {
+      "_comment": "Chiller setpoints, a floor rather than the achieved temperature: the compressor starts 1 degree above setpoint and stops at it, so the time-average sits above by roughly half the drift.",
+      "seagrass": 13.5,
+      "other": 12.5
+    },
+    "seagrass_sumps": [
+      "SA12",
+      "SA345",
+      "SC12",
+      "SE12"
+    ]
   },
   "nutrients": {
     "_comment": "In-situ samples taken by hand at the sumps, on different instruments from the Seneye probes. Read live from the Google Sheet on every run: paste the sheet's URL below, and in Sheets use File > Share > Publish to web > Nutrient > Comma-separated values so the harvester can read it without a login. Rows are matched to sumps by the Tank ID column (A12 -> SA12) and keyed on date + sump, so a corrected sheet overwrites the old values rather than duplicating them. If the fetch fails the stored samples are left untouched and data/nutrients.xlsx is used if present.",
