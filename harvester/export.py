@@ -25,6 +25,7 @@ import time
 from collections import defaultdict
 from typing import Any
 
+from . import schedule as sched
 from .derived import DERIVED_PARAMETERS, enrich, salinity_by_sump
 from .nutrients import ANALYTE_GROUPS as NUTRIENT_GROUPS
 from .nutrients import ANALYTES as NUTRIENT_ANALYTES
@@ -244,6 +245,8 @@ def build_payload(
         },
         "nutrients": nutrients,
         "plugs": _plugs(store, config, now),
+        "energy": _energy(store, config, now, window_days),
+        "schedule": sched.build(store, config, now),
         "ambient": _ambient(store, config, now, window_days, raw_days),
         "last_run": last_run[0] if last_run else None,
     }
@@ -356,6 +359,123 @@ def _plugs(store, config: dict[str, Any], now: int, history_days: int = 14) -> d
         "by_sump": by_sump,
         "history": history,
         "history_days": history_days,
+    }
+
+
+def _energy(store, config: dict[str, Any], now: int, window_days: int) -> dict[str, Any]:
+    """Energy drawn by each row of chillers, integrated from the meter series.
+
+    Deliberately not taken from the plugs' own `add_ele` counter. That resets
+    whenever a plug loses power and two of the five have been stuck on the same
+    figure for over a week, so it is the number that would look most
+    authoritative on a dashboard while being the least true.
+
+    What we have instead is a spot reading of power every half hour. Energy is
+    the area under that, by the trapezoidal rule. Two things follow and both
+    are published rather than hidden:
+
+    * A compressor cycles on its own thermostat, so half-hourly samples of it
+      are a sampling problem. Over a month the errors cancel and the figure is
+      close; over a single day it can be out by a fifth either way. The export
+      carries `coverage` so the dashboard can say which it is looking at.
+    * The meter is per plug, so this is per row, not per sump. Two chillers on
+      one plug cannot be told apart by a single meter, and halving the figure
+      would be arithmetic with no measurement behind it.
+    """
+    cfg = config.get("plugs") or {}
+    if not cfg.get("enabled", False):
+        return {"enabled": False}
+
+    try:
+        rows = store.query(
+            "SELECT device_id, reading_time, power_w, voltage_v FROM plug_power "
+            "WHERE reading_time >= ? ORDER BY device_id, reading_time",
+            (now - window_days * DAY,),
+        )
+    except Exception:  # table not created yet on an older database
+        return {"enabled": False}
+    if not rows:
+        return {"enabled": False}
+
+    labels, roles = {}, {}
+    for did, dcfg in (cfg.get("devices") or {}).items():
+        if did.startswith("_") or str(dcfg.get("kind", "")).lower() == "ambient":
+            continue
+        labels[did] = dcfg.get("label") or did
+        roles[did] = [s.get("sump") for s in (dcfg.get("sockets") or {}).values()
+                      if isinstance(s, dict) and s.get("sump")]
+
+    # A gap longer than this is an outage, not a long interval between
+    # readings. Integrating across it would invent consumption for hours
+    # nobody measured.
+    span = int(float(cfg.get("meter_gap_minutes", 90) or 90) * 60)
+
+    by_device: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for r in rows:
+        if r.get("power_w") is not None:
+            by_device[r["device_id"]].append(r)
+
+    devices, daily_all = [], defaultdict(lambda: defaultdict(float))
+    covered = defaultdict(lambda: defaultdict(float))
+    for did, series in by_device.items():
+        if did not in labels:
+            continue
+        watts = [float(r["power_w"]) for r in series]
+        volts = [float(r["voltage_v"]) for r in series if r.get("voltage_v")]
+        for a, b in zip(series, series[1:]):
+            dt = int(b["reading_time"]) - int(a["reading_time"])
+            if dt <= 0 or dt > span:
+                continue
+            mean_w = (float(a["power_w"]) + float(b["power_w"])) / 2
+            # Split the interval across midnight so a day's figure is a day's.
+            start, end = int(a["reading_time"]), int(b["reading_time"])
+            while start < end:
+                day = (start // DAY) * DAY
+                edge = min(end, day + DAY)
+                part = edge - start
+                daily_all[did][day] += mean_w * part / 3600 / 1000
+                covered[did][day] += part
+                start = edge
+        devices.append({
+            "device_id": did,
+            "label": labels[did],
+            "sumps": roles.get(did, []),
+            "now_w": _round(watts[-1], 1) if watts else None,
+            "peak_w": _round(max(watts), 1) if watts else None,
+            "mean_volts": _round(sum(volts) / len(volts), 1) if volts else None,
+            "samples": len(series),
+        })
+
+    tariff = cfg.get("tariff") or {}
+    rate = tariff.get("per_kwh")
+    try:
+        rate = float(rate) if rate is not None else None
+    except (TypeError, ValueError):
+        rate = None
+
+    series_out = []
+    for did in sorted(daily_all):
+        for day in sorted(daily_all[did]):
+            series_out.append({
+                "device_id": did, "day": day,
+                "kwh": _round(daily_all[did][day], 3),
+                # What fraction of that day the meter was actually being read.
+                # A day at 0.4 is not a quiet day, it is a day we only watched
+                # for ten hours, and the dashboard needs to be able to say so.
+                "coverage": _round(min(1.0, covered[did][day] / DAY), 3),
+            })
+
+    return {
+        "enabled": True,
+        "devices": sorted(devices, key=lambda d: d["label"]),
+        "daily": series_out,
+        "tariff": ({"per_kwh": rate, "currency": tariff.get("currency", "GBP"),
+                    "symbol": tariff.get("symbol", "\u00a3")} if rate else None),
+        "gap_seconds": span,
+        "note": ("Estimated by integrating a power reading taken every half hour. "
+                 "Reliable over a month, approximate over a single day, and per "
+                 "row rather than per sump because one meter serves both of a "
+                 "plug's sockets."),
     }
 
 

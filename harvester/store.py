@@ -268,6 +268,36 @@ class Store:
                 "CREATE INDEX IF NOT EXISTS idx_ambient_time ON ambient (reading_time)"
             )
 
+            # The meter readings need a row per poll, which is why they cannot
+            # live in plug_states: that table is a transition log and each
+            # update overwrites the last power figure. Energy is the integral
+            # of power over time, so it needs the series, not the latest value.
+            #
+            # add_ele is the plugs' own accumulated-energy counter. It is
+            # stored and never displayed: it resets when a plug loses power and
+            # two of the five have been stuck on the same figure for over a
+            # week, so it is the number that would look most authoritative on a
+            # dashboard while being the least true. Kept only so we can tell
+            # later whether it ever starts behaving.
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS plug_power (
+                    device_id {text} NOT NULL,
+                    reading_time INTEGER NOT NULL,
+                    power_w {numeric},
+                    voltage_v {numeric},
+                    current_ma {numeric},
+                    add_ele {numeric},
+                    online INTEGER,
+                    PRIMARY KEY (device_id, reading_time)
+                )
+                """
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_plug_power_time "
+                "ON plug_power (reading_time)"
+            )
+
             # CREATE TABLE IF NOT EXISTS is silent about a table that already
             # exists with fewer columns, so a database written by an earlier
             # version keeps its old shape and every later insert fails. Columns
@@ -529,6 +559,40 @@ class Store:
                 )
                 changes += 1
         return changes
+
+    def insert_plug_power(self, rows: Iterable[dict[str, Any]]) -> int:
+        """One meter reading per plug per poll.
+
+        A plug the cloud cannot reach is reporting whatever it last said, so
+        storing it would invent a flat line of consumption through an outage.
+        Its absence is what later tells the export that those hours are not
+        covered.
+        """
+        rows = list(rows)
+        if not rows:
+            return 0
+        columns = ("device_id", "reading_time", "power_w", "voltage_v",
+                   "current_ma", "add_ele", "online")
+        cols = ", ".join(columns)
+        marks = ", ".join("?" for _ in columns)
+        inserted = 0
+        with self.cursor() as cur:
+            for row in rows:
+                if row.get("online") == 0 or row.get("power_w") is None:
+                    continue
+                cur.execute(
+                    self.sql("SELECT 1 FROM plug_power WHERE device_id = ? "
+                             "AND reading_time = ?"),
+                    (row["device_id"], int(row["reading_time"])),
+                )
+                if cur.fetchone() is not None:
+                    continue
+                cur.execute(
+                    self.sql(f"INSERT INTO plug_power ({cols}) VALUES ({marks})"),
+                    tuple(row.get(c) for c in columns),
+                )
+                inserted += 1
+        return inserted
 
     def insert_ambient(self, rows: Iterable[dict[str, Any]]) -> int:
         rows = list(rows)

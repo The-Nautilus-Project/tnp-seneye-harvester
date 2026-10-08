@@ -147,7 +147,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(
                     f"plugs: {summary.get('polled', 0)} socket(s)/sensor(s) read, "
                     f"{summary.get('sockets', 0)} state change(s), "
-                    f"{summary.get('ambient', 0)} new air reading(s)"
+                    f"{summary.get('ambient', 0)} new air reading(s), "
+                    f"{summary.get('meter', 0)} meter reading(s)"
                     + (f", {summary['offline']} device(s) not answering"
                        if summary.get("offline") else "")
                 )

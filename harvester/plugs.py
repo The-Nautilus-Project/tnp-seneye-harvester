@@ -141,9 +141,39 @@ class AmbientReading:
 
 
 @dataclass
+class PowerSample:
+    """One meter reading from one plug, kept as a series rather than a state.
+
+    The meter is per plug, not per socket, so this is what the whole row draws.
+    Splitting it between two running chillers would be arithmetic with no
+    measurement behind it.
+    """
+
+    device_id: str
+    reading_time: int
+    power_w: float | None = None
+    voltage_v: float | None = None
+    current_ma: float | None = None
+    add_ele: float | None = None
+    online: int | None = None
+
+    def as_row(self) -> dict[str, Any]:
+        return {
+            "device_id": self.device_id,
+            "reading_time": self.reading_time,
+            "power_w": self.power_w,
+            "voltage_v": self.voltage_v,
+            "current_ma": self.current_ma,
+            "add_ele": self.add_ele,
+            "online": self.online,
+        }
+
+
+@dataclass
 class Poll:
     sockets: list[SocketState] = field(default_factory=list)
     ambient: list[AmbientReading] = field(default_factory=list)
+    power: list[PowerSample] = field(default_factory=list)
     raw: dict[str, dict[str, Any]] = field(default_factory=dict)
     offline: list[str] = field(default_factory=list)
 
@@ -467,6 +497,24 @@ def poll(client: TuyaClient, config: dict[str, Any], now: int | None = None) -> 
         power = _first(codes, POWER_CODES["power_w"][0])
         plug_power = None if power is None else _as_float(power, POWER_CODES["power_w"][1])
 
+        # The meter reading goes into its own series as well as onto the socket
+        # states. Energy is the integral of power over time, and plug_states
+        # overwrites its power column on every heartbeat, so the state table
+        # can answer "what is it drawing now" but never "what has it used".
+        volts = _first(codes, POWER_CODES["voltage_v"][0])
+        amps = _first(codes, POWER_CODES["current_ma"][0])
+        out.power.append(
+            PowerSample(
+                device_id=did,
+                reading_time=now,
+                power_w=plug_power,
+                voltage_v=None if volts is None else _as_float(volts, POWER_CODES["voltage_v"][1]),
+                current_ma=None if amps is None else _as_float(amps, POWER_CODES["current_ma"][1]),
+                add_ele=_as_float(codes.get("add_ele")),
+                online=online,
+            )
+        )
+
         def switch_value(code: str) -> Any:
             raw = codes.get(code)
             if raw is None and code == "switch_1":
@@ -528,9 +576,11 @@ def load(store, config: dict[str, Any], env: dict[str, str] | None = None) -> di
     result = poll(client, config)
     sockets = store.insert_plug_states(s.as_row() for s in result.sockets)
     ambient = store.insert_ambient(a.as_row() for a in result.ambient)
+    meter = store.insert_plug_power(p.as_row() for p in result.power)
     summary = {
         "sockets": sockets,
         "ambient": ambient,
+        "meter": meter,
         "polled": len(result.sockets) + len(result.ambient),
         "offline": len(result.offline),
         "subscription_days": subscription_days(cfg),
