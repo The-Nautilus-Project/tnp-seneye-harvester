@@ -272,6 +272,10 @@ td.plug-stale .since{color:var(--critical)}
   font:inherit;font-size:12px;color:var(--ink-2);padding:3px 10px;cursor:pointer;
 }
 .sched.one .more:hover{background:var(--surface-2)}
+.sched.one .more.flagged{
+  border-color:color-mix(in srgb,var(--warning) 60%,var(--rule));
+  color:var(--warning);font-weight:600;
+}
 .sched.one .more:focus-visible{outline:2px solid var(--focus);outline-offset:1px}
 .sched.one .count{margin-left:auto}
 .sched .col.wide{min-width:100%}
@@ -1727,6 +1731,20 @@ footer.notes code{font-variant-numeric:tabular-nums;font-size:11.5px;background:
     return {
       sc: sc, n: n, missing: missing, extra: extra, over: over,
       missedToday: missedToday, breachedToday: breachedToday,
+      // Two verdicts, because the strip above the chart and the chiller tab
+      // are answering different questions. The strip says what is happening
+      // now; a breach at 02:00 is history and belongs with the evidence, not
+      // in a line that is meant to describe this minute.
+      nowKind: over ? "critical" : (missing.length || extra.length) ? "warning" : "",
+      nowHeadline: over
+        ? n.running + " chillers running, the cabinet allows " + n.limit
+        : missing.length
+          ? (missing.length === 1 ? missing[0] + " is not cooling and should be"
+                                  : missing.length + " systems are not cooling and should be")
+          : extra.length
+            ? extra.join(", ") + " running outside " +
+              (extra.length === 1 ? "its" : "their") + " block"
+            : "Running to schedule",
       kind: over ? "critical"
         : (missing.length || extra.length || breachedToday.length || missedToday.length)
           ? "warning" : "",
@@ -1775,7 +1793,7 @@ footer.notes code{font-variant-numeric:tabular-nums;font-size:11.5px;background:
     if (!st) { box.hidden = true; return; }
     box.hidden = false;
     box.textContent = "";
-    box.className = "sched one" + (st.kind ? " " + st.kind : "");
+    box.className = "sched one" + (st.nowKind ? " " + st.nowKind : "");
 
     var mk = document.createElement("span");
     mk.className = "mark"; mk.setAttribute("aria-hidden", "true");
@@ -1783,7 +1801,7 @@ footer.notes code{font-variant-numeric:tabular-nums;font-size:11.5px;background:
 
     var head = document.createElement("span");
     head.className = "headline";
-    head.textContent = st.headline;
+    head.textContent = st.nowHeadline;
     box.appendChild(head);
 
     if (st.n.block) {
@@ -1802,11 +1820,23 @@ footer.notes code{font-variant-numeric:tabular-nums;font-size:11.5px;background:
                 "and three overnight. Each DC2200 rejects about 2.95 kW into it.";
     box.appendChild(cnt);
 
+    // Everything that went wrong earlier moved to the tab, which is right, but
+    // a clean line and a silent button would hide a morning that lost two
+    // blocks. The count is how it stays findable without the strip claiming
+    // something is wrong this minute.
+    var faults = st.missedToday.length + st.breachedToday.length;
     var more = document.createElement("button");
     more.type = "button";
-    more.className = "more";
-    more.textContent = "Chillers";
-    more.title = "Blocks missed, cabinet breaches and cooling hours";
+    more.className = "more" + (faults ? " flagged" : "");
+    more.textContent = faults ? "Chillers (" + faults + " today)" : "Chillers";
+    more.title = faults
+      ? faults + (faults === 1 ? " problem" : " problems") + " earlier today: " +
+        [st.missedToday.length ? st.missedToday.length +
+           (st.missedToday.length === 1 ? " block missed" : " blocks missed") : "",
+         st.breachedToday.length ? st.breachedToday.length +
+           (st.breachedToday.length === 1 ? " spell" : " spells") + " over the cabinet limit" : ""]
+          .filter(Boolean).join(", ")
+      : "Blocks missed, cabinet breaches and cooling hours";
     more.addEventListener("click", function () { state.view = "chillers"; renderAll(); });
     box.appendChild(more);
   }
