@@ -101,9 +101,41 @@ jobs:
                    dashboard/data/nursery.json dashboard/data/readings.csv; do
             [ -f "$f" ] && git add -f "$f"
           done
-          git diff --quiet --cached || git commit -m "harvest: readings at $(date -u +%Y-%m-%dT%H:%MZ)"
-          git pull --rebase --autostash origin ${GITHUB_REF_NAME} || true
-          git push
+          git diff --quiet --cached && { echo "nothing changed"; exit 0; }
+          git commit -m "harvest: readings at $(date -u +%Y-%m-%dT%H:%MZ)"
+
+          # Catching up with the branch is a merge, never a rebase, and
+          # conflicts resolve in favour of this run.
+          #
+          # A rebase was the wrong tool. Everything this job commits is
+          # generated: the SQLite file, the JSON and the CSV. Git cannot merge
+          # a binary at all, and the JSON is one long line, so any overlap with
+          # another push is a guaranteed conflict. The rebase then stopped
+          # half-way, `|| true` swallowed the failure, and the push ran from a
+          # detached HEAD and died with exit 128. The readings were committed
+          # and then thrown away.
+          #
+          # -X ours keeps this run's generated files where the two sides
+          # disagree, while still taking everything else from the branch, so a
+          # config.json pushed by hand during a harvest survives. The retry
+          # loop is for the narrower race where somebody pushes between the
+          # merge and the push.
+          for attempt in 1 2 3; do
+            git fetch origin "${GITHUB_REF_NAME}" || true
+            git merge --no-edit -X ours "origin/${GITHUB_REF_NAME}" || {
+              echo "merge failed outright, leaving the branch alone"
+              git merge --abort || true
+              exit 1
+            }
+            if git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              echo "pushed on attempt ${attempt}"
+              exit 0
+            fi
+            echo "push rejected, somebody else got there first; retrying"
+            sleep $((attempt * 5))
+          done
+          echo "could not push after three attempts" >&2
+          exit 1
 
   publish:
     needs: harvest
