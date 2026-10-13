@@ -1828,6 +1828,52 @@ class TestWorkbookRoute(unittest.TestCase):
         ):
             self.assertEqual(drive_download_url(link), wanted, link)
 
+    def test_the_real_share_link_for_the_nursery_workbook_resolves(self):
+        """The link Drive actually produced for this workbook.
+
+        Kept verbatim because of the ouid parameter on it: a looser pattern
+        reads `ouid=118023771820086390278` as the file ID, builds a download
+        URL for an account number, and fails with a sharing message that sends
+        you off to change a permission that was never the problem.
+        """
+        from harvester.nutrients import drive_candidates, drive_file_id
+        link = ("https://docs.google.com/spreadsheets/d/1x24c0MoK4xBdtODkkm0a"
+                "-XC9qbRFeO4O/edit?usp=sharing&ouid=118023771820086390278"
+                "&rtpof=true&sd=true")
+        self.assertEqual(drive_file_id(link), "1x24c0MoK4xBdtODkkm0a-XC9qbRFeO4O")
+        self.assertEqual(len(drive_candidates(link)), 2)
+        for candidate in drive_candidates(link):
+            self.assertIn("1x24c0MoK4xBdtODkkm0a-XC9qbRFeO4O", candidate)
+            self.assertNotIn("118023771820086390278", candidate)
+
+    def test_the_configured_link_is_one_the_parser_accepts(self):
+        """Whatever is in config.json has to resolve, or no run can work."""
+        from harvester.nutrients import drive_candidates
+        with open(os.path.join(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))), "config.json"), encoding="utf-8") as fh:
+            configured = (json.load(fh).get("nutrients") or {}).get("workbook_url")
+        if not configured:
+            self.skipTest("no workbook_url configured")
+        self.assertTrue(drive_candidates(configured))
+
+    def test_the_second_endpoint_is_tried_when_the_first_gives_a_web_page(self):
+        from harvester import nutrients
+        answers = [b"<html><body>Sign in</body></html>", _tiny_xlsx(SHEET_ROWS)]
+        with _urlopen_returning(answers):
+            payload = nutrients.fetch_workbook(
+                "https://drive.google.com/file/d/" + "a" * 30)
+        self.assertEqual(payload[:2], b"PK")
+
+    def test_both_endpoints_failing_names_what_each_one_said(self):
+        from harvester import nutrients
+        from harvester.nutrients import NutrientError
+        with _urlopen_returning([b"<html>no</html>", b"<html>no</html>"]):
+            with self.assertRaises(NutrientError) as caught:
+                nutrients.fetch_workbook("https://drive.google.com/file/d/" + "a" * 30)
+        message = str(caught.exception)
+        self.assertIn("drive.google.com answered", message)
+        self.assertIn("drive.usercontent.google.com answered", message)
+
     def test_an_already_direct_link_is_left_alone(self):
         from harvester.nutrients import drive_download_url
         url = "https://drive.usercontent.google.com/download?id=x&export=download"
@@ -1928,20 +1974,27 @@ class TestWorkbookRoute(unittest.TestCase):
 
 
 class _urlopen_returning:
-    """Make urllib hand back exactly these bytes, for the length of a block."""
+    """Make urllib hand back these bytes, for the length of a block.
+
+    Takes one payload, used for every call, or a list of them answered in
+    order so a retry across two endpoints can be exercised. The last entry
+    repeats once the list runs out.
+    """
 
     def __init__(self, payload):
-        self.payload = payload
+        self.queue = list(payload) if isinstance(payload, list) else [payload]
 
     def __enter__(self):
         import urllib.request
-        from harvester import nutrients
 
-        payload = self.payload
+        queue = list(self.queue)
+
+        def next_payload():
+            return queue.pop(0) if len(queue) > 1 else queue[0]
 
         class Response:
             def read(self):
-                return payload
+                return next_payload()
 
             def geturl(self):
                 return "https://drive.google.com/uc"
