@@ -124,6 +124,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.nutrients:
         config.setdefault("nutrients", {})["workbook"] = args.nutrients
         config["nutrients"].pop("sheet_url", None)
+        config["nutrients"].pop("workbook_url", None)
     if args.skip_nutrients:
         print("nutrients: skipped (--skip-nutrients)")
     else:

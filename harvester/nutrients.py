@@ -6,13 +6,24 @@ accuracy characteristics. They are stored and displayed as a separate method,
 never merged into the sensor series: where the two disagree, that is two
 instruments measuring, not an error to reconcile.
 
-Two sources, same parser:
+Three sources, same parser, tried in this order:
 
-* a published Google Sheet, fetched over HTTPS on every run (the live route)
+* the .xlsx itself in Drive, downloaded over HTTPS on every run (nutrients.
+  workbook_url). This is the file the tablet writes to, so it is the one route
+  that cannot go stale behind a copy.
+* a published Google Sheet (nutrients.sheet_url), fetched as CSV
 * an .xlsx committed to the repo at data/nutrients.xlsx (the offline fallback)
 
-Both are read with the standard library alone. The .xlsx is parsed straight
-out of its OOXML, so nothing has to be installed.
+All three are read with the standard library alone. The .xlsx is parsed
+straight out of its OOXML, so nothing has to be installed.
+
+The order exists because of a failure that cost a fortnight of readings. The
+sheet route reads a native Google Sheet, which an uploaded .xlsx cannot be, so
+for a while the live sheet was a duplicate of the workbook. Rows typed on the
+tablet went into the workbook, the harvester read the duplicate, and the
+dashboard quietly showed the state of the sampling programme as of the last
+time somebody remembered to copy one file into the other. Reading the workbook
+directly removes the copy, and with it the chance of that happening again.
 
 The parser handles the shape the TNP sheet is actually in: the date written
 once at the top of each sampling block and blank on the rows below it, dates
@@ -28,6 +39,7 @@ import datetime as dt
 import io
 import os
 import re
+import sys
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -134,9 +146,17 @@ def _sheet_path(zf: zipfile.ZipFile, wanted: str | None) -> str:
     return "xl/" + target.lstrip("/")
 
 
-def read_workbook_rows(path: str, sheet_name: str | None = "Nutrient") -> list[dict[str, str]]:
-    """Return the worksheet as a list of {column letter: cell text} rows."""
-    with zipfile.ZipFile(path) as zf:
+def read_workbook_rows(source: Any, sheet_name: str | None = "Nutrient") -> list[dict[str, str]]:
+    """Return the worksheet as a list of {column letter: cell text} rows.
+
+    `source` is a path on disk or the bytes of an .xlsx. Taking bytes lets the
+    workbook be read straight out of a Drive download without ever touching
+    the filesystem, which matters on the harvest runner where the checkout is
+    thrown away afterwards.
+    """
+    if isinstance(source, (bytes, bytearray)):
+        source = io.BytesIO(bytes(source))
+    with zipfile.ZipFile(source) as zf:
         strings = _shared_strings(zf)
         sheet = ET.fromstring(zf.read(_sheet_path(zf, sheet_name)))
 
@@ -363,10 +383,10 @@ def build_records(
     return records
 
 
-def parse_workbook(path: str, sumps: dict[str, Any] | None = None,
+def parse_workbook(source: Any, sumps: dict[str, Any] | None = None,
                    sheet_name: str | None = "Nutrient") -> list[dict[str, Any]]:
-    """Read an .xlsx export into sample records."""
-    return build_records(read_workbook_rows(path, sheet_name), sumps)
+    """Read an .xlsx, given as a path or as bytes, into sample records."""
+    return build_records(read_workbook_rows(source, sheet_name), sumps)
 
 
 def parse_csv_rows(text: str) -> list[dict[str, str]]:
@@ -449,6 +469,75 @@ def fetch_sheet_csv(url: str, timeout: int = 30) -> str:
     return text
 
 
+def drive_download_url(url: str) -> str:
+    """Normalise any Drive link to one that returns the file's own bytes.
+
+    Accepts the thing you actually get from Drive's Share button
+    (/file/d/<id>/view?usp=sharing), an /open?id= link, a bare file ID, or a
+    link that is already a download URL.
+    """
+    url = url.strip()
+    if not url:
+        raise NutrientError("nutrients.workbook_url is empty")
+    if "export=download" in url or "/uc?" in url:
+        return url
+    match = (re.search(r"/file/d/([A-Za-z0-9_-]{20,})", url)
+             or re.search(r"[?&]id=([A-Za-z0-9_-]{20,})", url)
+             or re.search(r"/spreadsheets/d/([A-Za-z0-9_-]{20,})", url)
+             or re.fullmatch(r"([A-Za-z0-9_-]{20,})", url))
+    if not match:
+        raise NutrientError(
+            f"could not find a Drive file ID in {url!r}. Use the link from "
+            "Drive's Share button, which looks like "
+            "https://drive.google.com/file/d/<long id>/view?usp=sharing"
+        )
+    return f"https://drive.google.com/uc?export=download&id={match.group(1)}"
+
+
+def fetch_workbook(url: str, timeout: int = 30) -> bytes:
+    """Download the .xlsx from Drive and return its bytes.
+
+    The checks here are all about failing with the reason rather than with a
+    parse error forty lines later. An unshared file answers with an HTML
+    permission page, and a sign-in redirect answers with an HTML login page;
+    both are valid HTTP 200s that are not a workbook. A real .xlsx is a zip,
+    so its first two bytes are PK.
+    """
+    target = drive_download_url(url)
+    request = urllib.request.Request(
+        target,
+        headers={
+            "User-Agent": "tnp-seneye-harvester/1.0",
+            "Accept": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, */*",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = response.read()
+    except urllib.error.HTTPError as exc:
+        raise NutrientError(
+            f"Drive returned HTTP {exc.code} for the workbook. Open it in "
+            "Drive, choose Share, and set General access to 'Anyone with the "
+            "link' as Viewer."
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise NutrientError(f"could not reach Google Drive: {exc}") from exc
+
+    if payload[:2] != b"PK":
+        head = payload[:400].decode("utf-8", "replace").lower()
+        if "<html" in head or "accounts.google.com" in head:
+            raise NutrientError(
+                "Drive answered with a web page rather than the file, which "
+                "means the link needs a login. Share the workbook as 'Anyone "
+                "with the link' (Viewer) and keep the same link."
+            )
+        raise NutrientError(
+            f"what Drive returned is not an .xlsx ({len(payload)} bytes, "
+            f"starting {payload[:8]!r})"
+        )
+    return payload
+
+
 def sheet_csv_url(url: str) -> str:
     """Normalise a Google Sheets URL to something that returns CSV."""
     url = url.strip()
@@ -473,8 +562,11 @@ def load(store, config: dict[str, Any], root: str) -> int:
 
     Order of preference:
 
-    1. the published Google Sheet, if a URL is configured
-    2. the .xlsx committed to the repo
+    1. the .xlsx in Drive, if nutrients.workbook_url is set. This is the file
+       the tablet writes to, so it is the only source that is the data rather
+       than a copy of it.
+    2. the published Google Sheet, if a URL is configured
+    3. the .xlsx committed to the repo
 
     A failed fetch is never fatal and never destructive: the samples already in
     the database stay exactly as they are, so a Google outage or a sheet that
@@ -487,8 +579,21 @@ def load(store, config: dict[str, Any], root: str) -> int:
     records: list[dict[str, Any]] = []
     source = None
 
+    workbook_url = nutrient_cfg.get("workbook_url")
+    if workbook_url:
+        try:
+            records = parse_workbook(
+                fetch_workbook(workbook_url), sumps,
+                nutrient_cfg.get("sheet", "Nutrient"),
+            )
+            source = "Drive workbook"
+        except NutrientError as exc:
+            print(f"nutrients: workbook download failed ({exc})")
+        except Exception as exc:
+            print(f"nutrients: the downloaded workbook could not be read ({exc})")
+
     url = nutrient_cfg.get("sheet_url")
-    if url:
+    if not records and url:
         try:
             text = fetch_sheet_csv(url)
             records = parse_csv(text, sumps)
@@ -507,19 +612,39 @@ def load(store, config: dict[str, Any], root: str) -> int:
         if os.path.exists(workbook):
             records = parse_workbook(workbook, sumps, nutrient_cfg.get("sheet", "Nutrient"))
             source = "workbook"
-        elif url:
-            # Be precise about which of the two routes failed: a fetch that
-            # errored is a different problem from never having been set up.
+        elif url or workbook_url:
+            # Be precise about which route failed: a fetch that errored is a
+            # different problem from never having been set up.
             print(
-                "nutrients: the sheet could not be read and there is no "
+                "nutrients: no configured source could be read and there is no "
                 f"{nutrient_cfg.get('workbook', 'data/nutrients.xlsx')} to fall "
                 "back on, so stored samples are left as they are"
             )
             return 0
         else:
-            print("nutrients: no sheet URL configured and no workbook on disk, skipping")
+            print("nutrients: no source configured and no workbook on disk, skipping")
             return 0
 
     written = store.upsert_nutrients(records)
-    print(f"nutrients: {len(records)} sample(s) from the {source}, {written} written")
+    newest = max((r["sample_date"] for r in records), default=None)
+    print(f"nutrients: {len(records)} sample(s) from the {source}, {written} written"
+          + (f", newest {newest}" if newest else ""))
+
+    # Say so when the source has nothing recent in it. A sampling round that
+    # was typed into the wrong file looks exactly like a sampling round that
+    # did not happen, and the symptom is silence: the table keeps showing the
+    # last figures it had. One line in the run log turns that into a question
+    # somebody can answer.
+    quiet_days = int(nutrient_cfg.get("warn_after_days") or 21)
+    if newest:
+        age = (dt.date.today() - dt.date.fromisoformat(newest)).days
+        if age > quiet_days:
+            print(
+                f"nutrients: WARNING the newest sample in the {source} is "
+                f"{newest}, {age} days ago. If sampling has been happening, "
+                "the rows are going somewhere the harvester is not reading: "
+                "check that nutrients.workbook_url points at the same file "
+                "the tablet writes to.",
+                file=sys.stderr,
+            )
     return written
