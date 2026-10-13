@@ -445,7 +445,7 @@
     "_comment": "In-situ samples taken by hand at the sumps, on different instruments from the Seneye probes. Three sources, tried in order: workbook_url (the .xlsx in Drive that the tablet writes to, the preferred route because it is the data itself rather than a copy), then sheet_url (a published native Google Sheet, read as CSV), then data/nutrients.xlsx in the repo. Rows are matched to sumps by the Tank ID column (A12 -> SA12) and keyed on date + sump, so a corrected value overwrites the old one rather than duplicating it. If every fetch fails the stored samples are left untouched.",
     "workbook_url": "",
     "_workbook_url_comment": "Paste the Drive share link for the .xlsx the tablet writes to (Share > Anyone with the link > Viewer, then Copy link). When this is set the harvester reads that workbook directly on every run, so there is no second copy to keep in step. Leave it empty to fall back to sheet_url.",
-    "sheet_url": "https://docs.google.com/spreadsheets/d/e/2PACX-1vS1m0jTUzyvyRZsUb-nCuRp5u3TtrWodfbNy3Y0FYeVuwmZYS9ELIS0t6fKGqm-eAUhgLmSJY844bxY/pub?gid=1845791900&single=true&output=csv",
+    "sheet_url": "https://docs.google.com/spreadsheets/d/1x24c0MoK4xBdtODkkm0a-XC9qbRFeO4O/edit?usp=sharing&ouid=118023771820086390278&rtpof=true&sd=true",
     "workbook": "data/nutrients.xlsx",
     "sheet": "Nutrient",
     "cache": "data/nutrients_latest.csv",
