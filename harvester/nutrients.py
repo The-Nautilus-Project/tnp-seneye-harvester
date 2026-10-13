@@ -481,6 +481,17 @@ def drive_download_url(url: str) -> str:
         raise NutrientError("nutrients.workbook_url is empty")
     if "export=download" in url or "/uc?" in url:
         return url
+    return f"https://drive.google.com/uc?export=download&id={drive_file_id(url)}"
+
+
+def drive_file_id(url: str) -> str:
+    """Pull the file ID out of a Drive or Sheets link.
+
+    The ouid parameter on a share link is the trap here: a pattern looking for
+    `id=` finds `ouid=118023771820086390278` and hands back an account number
+    as a file ID. The `[?&]id=` anchor is what keeps that from happening.
+    """
+    url = url.strip()
     match = (re.search(r"/file/d/([A-Za-z0-9_-]{20,})", url)
              or re.search(r"[?&]id=([A-Za-z0-9_-]{20,})", url)
              or re.search(r"/spreadsheets/d/([A-Za-z0-9_-]{20,})", url)
@@ -491,7 +502,26 @@ def drive_download_url(url: str) -> str:
             "Drive's Share button, which looks like "
             "https://drive.google.com/file/d/<long id>/view?usp=sharing"
         )
-    return f"https://drive.google.com/uc?export=download&id={match.group(1)}"
+    return match.group(1)
+
+
+def drive_candidates(url: str) -> list[str]:
+    """Every endpoint worth trying for one Drive file, in order.
+
+    Two of them, because Google has moved this twice. /uc is the old route and
+    still redirects; drive.usercontent.google.com is where it redirects to and
+    is the one that works when /uc answers with an interstitial instead of the
+    file. Trying both costs one extra request on a day when the first fails,
+    and saves a week of the sampling sheet quietly not arriving.
+    """
+    url = url.strip()
+    if "export=download" in url or "/uc?" in url:
+        return [url]
+    fid = drive_file_id(url)
+    return [
+        f"https://drive.google.com/uc?export=download&id={fid}",
+        f"https://drive.usercontent.google.com/download?id={fid}&export=download",
+    ]
 
 
 def fetch_workbook(url: str, timeout: int = 30) -> bytes:
@@ -503,39 +533,44 @@ def fetch_workbook(url: str, timeout: int = 30) -> bytes:
     both are valid HTTP 200s that are not a workbook. A real .xlsx is a zip,
     so its first two bytes are PK.
     """
-    target = drive_download_url(url)
-    request = urllib.request.Request(
-        target,
-        headers={
-            "User-Agent": "tnp-seneye-harvester/1.0",
-            "Accept": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, */*",
-        },
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            payload = response.read()
-    except urllib.error.HTTPError as exc:
-        raise NutrientError(
-            f"Drive returned HTTP {exc.code} for the workbook. Open it in "
-            "Drive, choose Share, and set General access to 'Anyone with the "
-            "link' as Viewer."
-        ) from exc
-    except urllib.error.URLError as exc:
-        raise NutrientError(f"could not reach Google Drive: {exc}") from exc
-
-    if payload[:2] != b"PK":
-        head = payload[:400].decode("utf-8", "replace").lower()
-        if "<html" in head or "accounts.google.com" in head:
-            raise NutrientError(
-                "Drive answered with a web page rather than the file, which "
-                "means the link needs a login. Share the workbook as 'Anyone "
-                "with the link' (Viewer) and keep the same link."
-            )
-        raise NutrientError(
-            f"what Drive returned is not an .xlsx ({len(payload)} bytes, "
-            f"starting {payload[:8]!r})"
+    reasons: list[str] = []
+    for target in drive_candidates(url):
+        request = urllib.request.Request(
+            target,
+            headers={
+                "User-Agent": "tnp-seneye-harvester/1.0",
+                "Accept": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, */*",
+            },
         )
-    return payload
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                payload = response.read()
+        except urllib.error.HTTPError as exc:
+            reasons.append(f"HTTP {exc.code}")
+            continue
+        except urllib.error.URLError as exc:
+            reasons.append(str(exc))
+            continue
+
+        if payload[:2] == b"PK":
+            return payload
+
+        head = payload[:600].decode("utf-8", "replace").lower()
+        if "accounts.google.com" in head or "sign in" in head:
+            reasons.append("a sign-in page")
+        elif "<html" in head:
+            reasons.append("a web page, not the file")
+        else:
+            reasons.append(f"{len(payload)} bytes starting {payload[:8]!r}")
+
+    told = "; ".join(f"{t.split('//')[1].split('/')[0]} answered {r}"
+                     for t, r in zip(drive_candidates(url), reasons))
+    raise NutrientError(
+        f"the workbook could not be downloaded ({told}). The usual cause is "
+        "sharing: open the file in Drive, choose Share, and set General "
+        "access to 'Anyone with the link' as Viewer. The link itself can stay "
+        "exactly as it is."
+    )
 
 
 def sheet_csv_url(url: str) -> str:
