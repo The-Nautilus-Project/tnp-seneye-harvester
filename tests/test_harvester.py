@@ -2,6 +2,7 @@
 
 import collections
 import datetime as dt
+import io
 import json
 import math
 import os
@@ -1750,6 +1751,215 @@ class TestScheduleCompliance(unittest.TestCase):
     def test_no_plug_history_says_so_rather_than_claiming_compliance(self):
         out = sched.build(self.store, self.config, self.now)
         self.assertFalse(out.get("ready"))
+
+
+
+def _tiny_xlsx(rows):
+    """An .xlsx holding `rows` of text cells, built with the standard library.
+
+    Written out by hand rather than with a library because the parser it is
+    testing reads OOXML by hand too: if a real workbook from Drive is going to
+    be parsed straight out of its bytes, the test should exercise those bytes.
+    """
+    import zipfile
+
+    def col(i):
+        name = ""
+        i += 1
+        while i:
+            i, r = divmod(i - 1, 26)
+            name = chr(65 + r) + name
+        return name
+
+    xml = ['<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/'
+           'spreadsheetml/2006/main"><sheetData>']
+    for n, row in enumerate(rows, start=1):
+        xml.append(f'<row r="{n}">')
+        for i, value in enumerate(row):
+            if value is None or value == "":
+                continue
+            text = (str(value).replace("&", "&amp;").replace("<", "&lt;"))
+            xml.append(f'<c r="{col(i)}{n}" t="inlineStr"><is><t>{text}</t></is></c>')
+        xml.append("</row>")
+    xml.append("</sheetData></worksheet>")
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("[Content_Types].xml",
+                    '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/'
+                    'package/2006/content-types"/>')
+        zf.writestr("xl/workbook.xml",
+                    '<?xml version="1.0"?><workbook xmlns="http://schemas.openxmlformats.org/'
+                    'spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/'
+                    'officeDocument/2006/relationships"><sheets>'
+                    '<sheet name="Nutrient" sheetId="1" r:id="rId1"/></sheets></workbook>')
+        zf.writestr("xl/_rels/workbook.xml.rels",
+                    '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/'
+                    'package/2006/relationships"><Relationship Id="rId1" Target="worksheets/'
+                    'sheet1.xml" Type="http://schemas.openxmlformats.org/officeDocument/2006/'
+                    'relationships/worksheet"/></Relationships>')
+        zf.writestr("xl/worksheets/sheet1.xml", "".join(xml))
+    return buf.getvalue()
+
+
+SHEET_ROWS = [
+    ["", "Date", "Time", "Tank ID", "Temp (\u00b0C)", "Salinity (ppt)", "pH"],
+    ["", "13/08/2026", "12:38", "A12", "14.1", "36.18", "7.4"],
+    ["", "", "", "A345", "15.6", "36.93", "7.4"],
+]
+
+
+class TestWorkbookRoute(unittest.TestCase):
+    """Reading the .xlsx in Drive directly, which is the file people type into.
+
+    This exists because of a real failure: the harvester read a published
+    Google Sheet that was a duplicate of the workbook, so a sampling round
+    typed on the tablet never reached the dashboard and nothing said so.
+    """
+
+    def test_share_links_of_every_shape_resolve_to_a_download(self):
+        from harvester.nutrients import drive_download_url
+        wanted = "https://drive.google.com/uc?export=download&id=" + "a" * 30
+        for link in (
+            "https://drive.google.com/file/d/" + "a" * 30 + "/view?usp=sharing",
+            "https://drive.google.com/open?id=" + "a" * 30,
+            "https://docs.google.com/spreadsheets/d/" + "a" * 30 + "/edit?rtpof=true",
+            "a" * 30,
+        ):
+            self.assertEqual(drive_download_url(link), wanted, link)
+
+    def test_an_already_direct_link_is_left_alone(self):
+        from harvester.nutrients import drive_download_url
+        url = "https://drive.usercontent.google.com/download?id=x&export=download"
+        self.assertEqual(drive_download_url(url), url)
+
+    def test_something_that_is_not_a_drive_link_says_so(self):
+        from harvester.nutrients import NutrientError, drive_download_url
+        with self.assertRaises(NutrientError):
+            drive_download_url("https://example.com/sheet.xlsx")
+
+    def test_a_workbook_parses_from_bytes_without_touching_disk(self):
+        from harvester.nutrients import parse_workbook
+        records = parse_workbook(_tiny_xlsx(SHEET_ROWS),
+                                 {"SA12": {}, "SA345": {}}, "Nutrient")
+        self.assertEqual([r["sump_code"] for r in records], ["SA12", "SA345"])
+        # the date is written once per block and carried down
+        self.assertEqual({r["sample_date"] for r in records}, {"2026-08-13"})
+        self.assertAlmostEqual(records[1]["salinity_ppt"], 36.93)
+
+    def test_a_permission_page_is_reported_as_a_sharing_problem(self):
+        from harvester import nutrients
+        from harvester.nutrients import NutrientError
+        page = b"<!DOCTYPE html><html><head><title>Sign in</title></head></html>"
+        with _urlopen_returning(page):
+            with self.assertRaises(NutrientError) as caught:
+                nutrients.fetch_workbook("https://drive.google.com/file/d/" + "a" * 30)
+        self.assertIn("Anyone with the link", str(caught.exception))
+
+    def test_the_workbook_wins_over_the_published_sheet(self):
+        from harvester import nutrients
+        store = Store("sqlite:///:memory:")
+        store.migrate()
+        config = {
+            "sumps": {"SA12": {}, "SA345": {}},
+            "nutrients": {"workbook_url": "https://drive.google.com/file/d/" + "a" * 30,
+                          "sheet_url": "https://docs.google.com/spreadsheets/d/e/x/pub?output=csv",
+                          "cache": None},
+        }
+        asked = []
+
+        def never(url, timeout=30):
+            asked.append(url)
+            raise AssertionError("the sheet must not be fetched when the workbook works")
+
+        original = nutrients.fetch_sheet_csv
+        nutrients.fetch_sheet_csv = never
+        try:
+            with _urlopen_returning(_tiny_xlsx(SHEET_ROWS)):
+                written = nutrients.load(store, config, ".")
+        finally:
+            nutrients.fetch_sheet_csv = original
+        self.assertEqual(written, 2)
+        self.assertEqual(asked, [])
+        store.close()
+
+    def test_a_failed_download_falls_back_to_the_sheet(self):
+        from harvester import nutrients
+        store = Store("sqlite:///:memory:")
+        store.migrate()
+        config = {
+            "sumps": {"SA12": {}},
+            "nutrients": {"workbook_url": "https://drive.google.com/file/d/" + "a" * 30,
+                          "sheet_url": "https://docs.google.com/spreadsheets/d/e/x/pub?output=csv",
+                          "cache": None},
+        }
+        csv_text = "\n".join([
+            ",Date,Time,Tank ID,Temp (\u00b0C),Salinity (ppt),pH",
+            ",13/08/2026,12:38,A12,14.1,36.18,7.4",
+        ])
+        original = nutrients.fetch_sheet_csv
+        nutrients.fetch_sheet_csv = lambda url, timeout=30: csv_text
+        try:
+            with _urlopen_returning(b"<html>no</html>"):
+                written = nutrients.load(store, config, ".")
+        finally:
+            nutrients.fetch_sheet_csv = original
+        self.assertEqual(written, 1)
+        store.close()
+
+    def test_a_source_with_nothing_recent_in_it_warns(self):
+        from harvester import nutrients
+        store = Store("sqlite:///:memory:")
+        store.migrate()
+        config = {"sumps": {"SA12": {}, "SA345": {}},
+                  "nutrients": {"workbook_url": "https://drive.google.com/file/d/" + "a" * 30,
+                                "cache": None}}
+        err = io.StringIO()
+        original = sys.stderr
+        sys.stderr = err
+        try:
+            with _urlopen_returning(_tiny_xlsx(SHEET_ROWS)):
+                nutrients.load(store, config, ".")
+        finally:
+            sys.stderr = original
+        self.assertIn("newest sample", err.getvalue())
+        self.assertIn("2026-08-13", err.getvalue())
+        store.close()
+
+
+class _urlopen_returning:
+    """Make urllib hand back exactly these bytes, for the length of a block."""
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    def __enter__(self):
+        import urllib.request
+        from harvester import nutrients
+
+        payload = self.payload
+
+        class Response:
+            def read(self):
+                return payload
+
+            def geturl(self):
+                return "https://drive.google.com/uc"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        self.original = urllib.request.urlopen
+        urllib.request.urlopen = lambda *a, **k: Response()
+        return self
+
+    def __exit__(self, *exc):
+        import urllib.request
+        urllib.request.urlopen = self.original
+        return False
 
 
 if __name__ == "__main__":
