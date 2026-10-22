@@ -5,7 +5,14 @@ on:
     # every 30 minutes; GitHub's scheduler is best-effort, so a run can be late
     # or skipped when the service is busy. The harvester is idempotent, so a
     # missed run only costs the readings the Seneye API had at that moment.
-    - cron: "*/30 * * * *"
+    #
+    # Two lines rather than one "*/30" so the publish job can tell them apart
+    # (github.event.schedule holds the line that fired). Both harvest; only the
+    # :13 run redeploys Pages. Each job is billed as at least a whole minute, so
+    # publishing hourly instead of half-hourly saves about 700 Actions minutes a
+    # month on a private repo, and the dashboard is at most an hour behind.
+    - cron: "13 * * * *"     # harvest and publish
+    - cron: "43 * * * *"     # harvest only
   workflow_dispatch:
   push:
     # Publishing to Pages lives in this workflow's publish job, so a change to
@@ -140,7 +147,9 @@ jobs:
   publish:
     needs: harvest
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
+    # Manual runs and dashboard pushes always publish; of the scheduled runs,
+    # only the hourly :13 one does.
+    if: github.ref == 'refs/heads/main' && github.event.schedule != '43 * * * *'
     timeout-minutes: 10
     concurrency:
       group: pages

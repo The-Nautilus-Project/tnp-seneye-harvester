@@ -72,9 +72,9 @@ SQLite backend. Python 3.9+.
 **4. On GitHub Actions**
 
 Add two repository secrets, `SENEYE_USER` and `SENEYE_PWD`. The workflow in
-`.github/workflows/harvest.yml` polls every 30 minutes, commits the updated
-database and JSON export back to the repo, and publishes `dashboard/` to GitHub
-Pages. GitHub's scheduler is best-effort, so a run is occasionally late or
+`.github/workflows/harvest.yml` polls every 30 minutes and commits the updated
+database and JSON export back to the repo. It publishes `dashboard/` to GitHub
+Pages once an hour, on the :13 run, to save Actions minutes. GitHub's scheduler is best-effort, so a run is occasionally late or
 skipped; the harvester is idempotent, so that only ever costs the one reading
 the API was holding at that moment.
 
