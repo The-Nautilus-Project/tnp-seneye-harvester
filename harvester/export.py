@@ -535,6 +535,20 @@ def _ambient(store, config: dict[str, Any], now: int, window_days: int,
         if k in keys
     ]
 
+    # When each sensor's values last moved, worked out from our own readings.
+    # Tuya's update_time was meant to say this, but on the nursery sensor it
+    # stopped advancing on 22 Oct 2026 while the humidity kept changing every
+    # hour, so the dashboard said "last reported 22 Oct" over a live reading.
+    # Rows are in time order, so the last change seen is the latest one.
+    moved: dict[str, int] = {}
+    last_vals: dict[str, tuple] = {}
+    for r in rows:
+        did = r["device_id"]
+        vals = tuple(r.get(k) for k in keys)
+        if did not in last_vals or vals != last_vals[did]:
+            moved[did] = int(r["reading_time"])
+        last_vals[did] = vals
+
     latest: dict[str, Any] = {}
     for r in rows:
         did = r["device_id"]
@@ -545,7 +559,7 @@ def _ambient(store, config: dict[str, Any], now: int, window_days: int,
             # move, which is older and is the one that says something about the
             # sensor's health. Collapsing the two made a working sensor look
             # stale and, worse, threw most of its readings away.
-            reported = _as_int(r.get("reported_at"))
+            reported = max(_as_int(r.get("reported_at")) or 0, moved.get(did, 0)) or None
             latest[did] = {
                 "t": int(r["reading_time"]),
                 "reported": reported if reported else int(r["reading_time"]),

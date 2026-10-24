@@ -1487,6 +1487,25 @@ class TestPlugExport(unittest.TestCase):
         self.assertEqual(len(ambient["readings"]), 2)
         self.assertEqual({r[0] for r in ambient["readings"]}, {"newSensor"})
 
+    def test_last_change_comes_from_the_readings_when_tuya_stops_updating(self):
+        # On 22 Oct 2026 Tuya's update_time for the nursery sensor froze while
+        # the humidity kept moving, and the dashboard showed "last reported
+        # 22 Oct" over a reading taken minutes earlier.
+        store = Store("sqlite:///:memory:")
+        store.migrate()
+        frozen = self.now - 2 * 86400
+        store.insert_ambient([
+            {"device_id": "airSensor", "reading_time": self.now - 5400, "reported_at": frozen,
+             "air_temperature": 18.4, "humidity": 77, "battery": None, "online": 1},
+            {"device_id": "airSensor", "reading_time": self.now - 3600, "reported_at": frozen,
+             "air_temperature": 18.2, "humidity": 79, "battery": None, "online": 1},
+            {"device_id": "airSensor", "reading_time": self.now - 600, "reported_at": frozen,
+             "air_temperature": 18.2, "humidity": 79, "battery": None, "online": 1},
+        ])
+        latest = build_payload(store, PLUG_CONFIG, 30, 30)["ambient"]["latest"]["airSensor"]
+        self.assertEqual(latest["t"], self.now - 600)
+        self.assertEqual(latest["reported"], self.now - 3600)
+
     def test_readings_from_an_unlisted_device_are_left_out(self):
         store = Store("sqlite:///:memory:")
         store.migrate()
