@@ -167,5 +167,33 @@ jobs:
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dashboard
-      - id: deploy
+
+      # The upload reports the artifact as finalised, but GitHub's artifact
+      # listing can lag behind by a few seconds. deploy-pages asks for it
+      # straight away, gets "Found 0 artifact(s)" and fails the run, even
+      # though the harvest and the upload both worked. A short pause first,
+      # then one retry after a longer pause, rides out that lag.
+      - name: Let the artifact listing catch up
+        run: sleep 15
+
+      - id: deploy_first
         uses: actions/deploy-pages@v4
+        continue-on-error: true
+
+      - name: Wait before retrying the deploy
+        if: steps.deploy_first.outcome == 'failure'
+        run: |
+          echo "first deploy attempt failed, retrying in 45 seconds"
+          sleep 45
+
+      - id: deploy_retry
+        if: steps.deploy_first.outcome == 'failure'
+        uses: actions/deploy-pages@v4
+
+      # The environment URL above reads steps.deploy, so this step gives it
+      # whichever attempt succeeded.
+      - id: deploy
+        run: |
+          url="${{ steps.deploy_first.outputs.page_url }}"
+          [ -z "$url" ] && url="${{ steps.deploy_retry.outputs.page_url }}"
+          echo "page_url=$url" >> "$GITHUB_OUTPUT"
